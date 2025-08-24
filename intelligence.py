@@ -1,9 +1,25 @@
 import random
 from itertools import combinations
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Move PlayerInfo here to avoid circular import
+class PlayerInfo:
+    def __init__(self, my_cards: list, moves: list):
+        self.my_cards = my_cards
+        self.moves = moves
+
+    def last_play(self):
+        for rel_id, cards in reversed(self.moves):
+            if cards is not None:
+                return rel_id, cards
+        return None
 
 class Intelligence:
     @staticmethod
     def _counts(cards):
+        """Count occurrences of each card rank."""
         d = {}
         for c in cards:
             d[c] = d.get(c, 0) + 1
@@ -11,12 +27,14 @@ class Intelligence:
 
     @staticmethod
     def _is_consecutive_no_high(ranks):
+        """Check if ranks are consecutive and below 2 (rank 12)."""
         if not ranks or max(ranks) >= 12:
             return False
         return all(ranks[i] + 1 == ranks[i + 1] for i in range(len(ranks) - 1))
 
     @staticmethod
     def _consecutive_segments(sorted_ranks):
+        """Group consecutive ranks into segments."""
         if not sorted_ranks:
             return []
         segs = [[sorted_ranks[0]]]
@@ -29,6 +47,7 @@ class Intelligence:
 
     @staticmethod
     def _judge_category(cards):
+        """Determine the category of a played card combination."""
         if cards is None or len(cards) == 0:
             return {"type": "pass", "length": 0}
 
@@ -101,9 +120,9 @@ class Intelligence:
 
         return {"type": "unknown", "length": n}
 
-    def give_risk_state(self, cards: list) -> int:
-        """For landlord bidding: simple heuristic (based on high cards)."""
-        high_cards = sum(1 for c in cards if c >= 10)  # 10, J, Q, K, A, 2, jokers
+    def give_risk_state(self, pinfo: PlayerInfo) -> int:
+        """For landlord bidding: heuristic based on high cards."""
+        high_cards = sum(1 for c in pinfo.my_cards if c >= 10)
         if high_cards > 8:
             return 3
         elif high_cards > 5:
@@ -111,32 +130,31 @@ class Intelligence:
         else:
             return 1
 
-    def play_first(self, cards: list, judge_fn):
-        """Start a new round: pick a random valid move, prefer winning if possible."""
-        possible = self._generate_all_moves(cards, judge_fn=judge_fn)
+    def play_first(self, pinfo: PlayerInfo, judge_fn):
+        """Start a new round: pick a random valid move, prefer winning."""
+        possible = Intelligence._generate_all_moves(pinfo.my_cards, judge_fn=judge_fn)
         if not possible:
             return None
-        # Prefer moves that empty hand
-        winning_moves = [m for m in possible if len(cards) - len(m) == 0]
+        winning_moves = [m for m in possible if len(pinfo.my_cards) - len(m) == 0]
         if winning_moves:
             return random.choice(winning_moves)
         return random.choice(possible)
 
-    def respond(self, cards: list, last_play_cat, judge_fn):
-        """Respond to last play: pick a valid beating move, prefer winning if possible."""
-        possible = self._generate_all_moves(cards, last_play=last_play_cat, judge_fn=judge_fn)
+    def respond(self, pinfo: PlayerInfo, last_play_cat, judge_fn):
+        """Respond to last play: pick a valid beating move, prefer winning."""
+        possible = Intelligence._generate_all_moves(pinfo.my_cards, last_play=last_play_cat, judge_fn=judge_fn)
         if not possible:
             return None
-        # Prefer moves that empty hand
-        winning_moves = [m for m in possible if len(cards) - len(m) == 0]
+        winning_moves = [m for m in possible if len(pinfo.my_cards) - len(m) == 0]
         if winning_moves:
             return random.choice(winning_moves)
         return random.choice(possible)
 
-    def _generate_all_moves(self, cards: list, last_play=None, judge_fn=None):
+    @staticmethod
+    def _generate_all_moves(cards: list, last_play=None, judge_fn=None):
         """Generate all valid moves given current cards and last play category."""
         moves = []
-        cnt = self._counts(cards)
+        cnt = Intelligence._counts(cards)
 
         # --- Singles, pairs, triples, bombs ---
         for u, c in cnt.items():
@@ -184,7 +202,7 @@ class Intelligence:
 
         # --- Airplanes (2+ consecutive triples, optional wings) ---
         trip_ranks = sorted([r for r in range(0, 12) if cnt.get(r, 0) >= 3])
-        segments = self._consecutive_segments(trip_ranks)
+        segments = Intelligence._consecutive_segments(trip_ranks)
         for seg in segments:
             if len(seg) < 2:
                 continue
@@ -192,20 +210,14 @@ class Intelligence:
                 for end in range(start + 2, len(seg) + 1):
                     main_trip = seg[start:end]
                     k = len(main_trip)
-                    # Pure airplane
                     airplane_cards = [r for r in main_trip for _ in range(3)]
                     moves.append(airplane_cards)
-                    # Remaining ranks not in main triples
                     avail_solo_ranks = [r for r in cnt if r not in main_trip and cnt[r] >= 1]
                     avail_pair_ranks = [r for r in cnt if r not in main_trip and cnt[r] >= 2]
-
-                    # --- Solo wings ---
                     if len(avail_solo_ranks) >= k:
                         for wings in combinations(avail_solo_ranks, k):
                             wing_cards = list(wings)
                             moves.append(airplane_cards + wing_cards)
-
-                    # --- Pair wings ---
                     if len(avail_pair_ranks) >= k:
                         for wings in combinations(avail_pair_ranks, k):
                             wing_cards = [r for r in wings for _ in range(2)]
@@ -231,3 +243,129 @@ class Intelligence:
             moves = filtered
 
         return moves
+
+class BaseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Input: 15 (hand counts) + 10 * (3 rel_id + 15 cards) = 195
+        self.fc1 = nn.Linear(195, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        return x
+
+class BidHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(64, 3)  # Outputs logits for risk 1, 2, 3
+
+    def forward(self, x):
+        return self.fc(x)
+
+class PolicyHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(64 + 15, 1)  # Base features + action encoding
+
+    def forward(self, x):
+        return self.fc(x)
+
+class ModelIntelligence(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = BaseModel()
+        self.bid_head = BidHead()
+        self.play_first_head = PolicyHead()
+        self.respond_head = PolicyHead()
+        self.train_mode = False
+
+    def encode_hand(self, cards):
+        """Encode cards as a 15-dim vector of counts (ranks 0-14)."""
+        count = [0] * 15
+        for c in cards:
+            count[c] += 1
+        return torch.tensor(count, dtype=torch.float)
+
+    def encode_action(self, cards):
+        """Encode a move as a 15-dim vector of counts."""
+        return self.encode_hand(cards)
+
+    def encode_state(self, pinfo: PlayerInfo):
+        """Encode game state: hand + last 10 moves (rel_id + cards)."""
+        hand_enc = self.encode_hand(pinfo.my_cards)
+        history_enc = []
+        moves = pinfo.moves[-10:]  # Last 10 moves
+        for rel_id, mcards in moves:
+            if mcards is None:
+                move_enc = torch.zeros(15)
+            else:
+                move_enc = self.encode_hand(mcards)
+            rel_onehot = torch.zeros(3)
+            rel_idx = rel_id + 1  # -1 (last) -> 0, 0 (me) -> 1, 1 (next) -> 2
+            rel_onehot[rel_idx] = 1
+            history_enc.append(torch.cat([rel_onehot, move_enc]))
+        num_pad = 10 - len(moves)
+        if num_pad > 0:
+            pad = [torch.zeros(18) for _ in range(num_pad)]
+            history_enc = pad + history_enc
+        history_enc = torch.cat(history_enc, dim=0)
+        state = torch.cat([hand_enc, history_enc])
+        return state
+
+    def give_risk_state(self, pinfo: PlayerInfo) -> int:
+        """Predict bidding risk (1, 2, 3)."""
+        state = self.encode_state(pinfo)
+        feat = self.base(state)
+        logits = self.bid_head(feat)
+        if self.train_mode:
+            probs = F.softmax(logits, dim=-1)
+            risk = torch.multinomial(probs, 1).item() + 1
+        else:
+            risk = torch.argmax(logits).item() + 1
+        return risk
+
+    def play_first(self, pinfo: PlayerInfo, judge_fn):
+        """Select a move to start a round."""
+        possible = Intelligence._generate_all_moves(pinfo.my_cards, judge_fn=judge_fn)
+        if not possible:
+            return None
+        state = self.encode_state(pinfo)
+        feat = self.base(state)
+        scores = []
+        for mv in possible:
+            act_enc = self.encode_action(mv)
+            input_policy = torch.cat([feat, act_enc])
+            score = self.play_first_head(input_policy)
+            scores.append(score)
+        scores = torch.stack(scores)
+        if self.train_mode:
+            probs = F.softmax(scores.squeeze(-1), dim=0)
+            idx = torch.multinomial(probs, 1).item()
+        else:
+            idx = torch.argmax(scores).item()
+        return possible[idx]
+
+    def respond(self, pinfo: PlayerInfo, last_play_cat, judge_fn):
+        """Select a move to beat last_play_cat."""
+        possible = Intelligence._generate_all_moves(pinfo.my_cards, last_play=last_play_cat, judge_fn=judge_fn)
+        if not possible:
+            return None
+        state = self.encode_state(pinfo)
+        feat = self.base(state)
+        scores = []
+        for mv in possible:
+            act_enc = self.encode_action(mv)
+            input_policy = torch.cat([feat, act_enc])
+            score = self.respond_head(input_policy)
+            scores.append(score)
+        scores = torch.stack(scores)
+        if self.train_mode:
+            probs = F.softmax(scores.squeeze(-1), dim=0)
+            idx = torch.multinomial(probs, 1).item()
+        else:
+            idx = torch.argmax(scores).item()
+        return possible[idx]

@@ -55,6 +55,7 @@ class Game:
         self.starting_player = random.choice([0, 1, 2])
         if self.show_process:
             for p in self.players:
+                p.cards.sort()
                 print(f"Player {p.index} init cards: {self.show_cards(p.cards)}")
             print(f"Reserved cards: {self.show_cards(self.reserved_cards)}\n")
 
@@ -144,7 +145,8 @@ class Game:
                 next_player.intelligence.grade += self.risk
                 prev_player.intelligence.grade += self.risk
             winner = "Landlord" if is_lord else "Peasants"
-            print(f"Game Over! {winner} win! (Player {self.playing_role} emptied hand)")
+            if self.show_process:
+                print(f"Game Over! {winner} win! (Player {self.playing_role} emptied hand)")
 
         self.playing_role = (self.playing_role + 1) % 3
 

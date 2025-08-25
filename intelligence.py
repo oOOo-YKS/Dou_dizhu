@@ -203,6 +203,7 @@ class Intelligence:
 
         if last_play:
             filtered = []
+            filtered.append([])
             last_type, last_len, last_main = last_play["type"], last_play["length"], last_play.get("main", [])
             for mv in moves:
                 cat = judge_fn(mv)

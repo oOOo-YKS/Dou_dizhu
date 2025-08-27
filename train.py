@@ -3,8 +3,10 @@ import glob
 from intelligence import Model
 from game import Game
 
-train_loop = 30
-model_num_index = 5
+train_loop = 100
+model_num_index = 2
+
+import torch
 
 
 def get_most_recent_model(path="D:/Models"):
@@ -21,10 +23,11 @@ def get_most_recent_model(path="D:/Models"):
         raise Exception(f"Error finding most recent model file in {path}: {str(e)}")
 
 def loop():
-    for i in range(model_num - 2):
-        for j in range(i + 1, model_num - 1):
-            for h in range(j + 1, model_num):
-                Game(models[i], models[j], models[h], show_process=False).play_game()
+    with torch.no_grad():
+        for i in range(model_num - 2):
+            for j in range(i + 1, model_num - 1):
+                for h in range(j + 1, model_num):
+                    Game(models[i], models[j], models[h], show_process=False).play_game()
 
     models.sort(key=lambda x: x.grade, reverse=True)
     for i in range(model_num_index):

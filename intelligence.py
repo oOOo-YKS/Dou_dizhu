@@ -233,10 +233,50 @@ class BaseModel(nn.Module):
         r2 = F.relu(y2)
         return r2
 
+
+class HistoryRnnModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rnn = nn.GRU(input_size=18, hidden_size=128, num_layers=2, batch_first=False)
+        self.fc = nn.Linear(128, 80)
+
+    def forward(self, x):
+        # x: (seq_len, 18)
+        out, _ = self.rnn(x.unsqueeze(1))  # Add "batch" as 1 for GRU (shape: (seq_len, 1, 18))
+        last_out = out[-1, 0, :]  # Get last timestep output: shape (128,)
+        embedding = self.fc(last_out)  # shape (80,)
+        return embedding
+    
+class HandModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(15, 30)
+
+    def forward(self, x):
+        # x: (15,)
+        return self.fc(x)  # shape (30,)
+    
+class StateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.history = HistoryRnnModel()
+        self.hand = HandModel()
+        self.fc = nn.Linear(80 + 30, 128)  # Combine history and hand
+
+    def forward(self, history_enc, hand_enc):
+        # history_enc: (seq_len, 18)
+        # hand_enc: (15,)
+        history_info = self.history(history_enc)  # (80,)
+        hand_info = self.hand(hand_enc)  # (30,)
+        combined = torch.cat([history_info, hand_info], dim=-1)  # (110,)
+        return self.fc(combined)  # (128,)
+
+        
+
 class BidHead(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = nn.Linear(64, 3)
+        self.fc = nn.Linear(128, 3)
 
     def forward(self, x):
         return self.fc(x)
@@ -244,7 +284,7 @@ class BidHead(nn.Module):
 class PolicyHead(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = nn.Linear(64 + 15 + 1, 1)
+        self.fc = nn.Linear(128 + 15 + 1, 1)
 
     def forward(self, x):
         return self.fc(x)
@@ -253,7 +293,7 @@ class Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.grade = 0
-        self.base = BaseModel()
+        self.state = StateModel()
         self.bid_head = BidHead()
         self.play_first_head = PolicyHead()
         self.respond_head = PolicyHead()
@@ -301,20 +341,23 @@ class Model(nn.Module):
     def encode_state(self, pinfo: PlayerInfo):
         """Encode player state (hand + move history)."""
         hand_enc = self.encode_hand(pinfo.my_cards)
-        history_enc = torch.zeros(10, 18, dtype=torch.float)
-        moves = pinfo.moves[-10:]
+        moves = pinfo.moves
+        if len(moves) == 0:
+            history_enc = torch.zeros(1, 18)  # shape (1, 18)
+        else:
+            history_enc = torch.zeros(len(moves), 18, dtype=torch.float)
         for i, (rel_id, mcards) in enumerate(moves):
             move_enc = torch.zeros(15) if mcards is None else self.encode_hand(mcards)
             rel_onehot = torch.zeros(3)
             rel_onehot[rel_id + 1] = 1
             history_enc[i] = torch.cat([rel_onehot, move_enc])
-        return torch.cat([hand_enc, history_enc.flatten()])
+        
+        return self.state(history_enc, hand_enc)
 
     def give_risk_state(self, pinfo: PlayerInfo) -> int:
         """Predict bidding risk (1, 2, 3)."""
         state = self.encode_state(pinfo)
-        feat = self.base(state)
-        logits = self.bid_head(feat)
+        logits = self.bid_head(state)
         return (torch.multinomial(F.softmax(logits, dim=-1), 1).item() + 1) if self.train_mode else torch.argmax(logits).item() + 1
 
     def play_first(self, pinfo: PlayerInfo, lord, judge_fn):
@@ -323,9 +366,8 @@ class Model(nn.Module):
         if not possible:
             return None
         state = self.encode_state(pinfo)
-        feat = self.base(state)
         lord_enc = self.encode_lord(lord)
-        scores = torch.stack([self.play_first_head(torch.cat([feat, self.encode_action(mv), lord_enc])) for mv in possible])
+        scores = torch.stack([self.play_first_head(torch.cat([state, self.encode_action(mv), lord_enc])) for mv in possible])
         idx = torch.multinomial(F.softmax(scores.squeeze(-1), dim=0), 1).item() if self.train_mode else torch.argmax(scores).item()
         return possible[idx]
 
@@ -335,8 +377,7 @@ class Model(nn.Module):
         if not possible:
             return None
         state = self.encode_state(pinfo)
-        feat = self.base(state)
         lord_enc = self.encode_lord(lord)
-        scores = torch.stack([self.respond_head(torch.cat([feat, self.encode_action(mv), lord_enc])) for mv in possible])
+        scores = torch.stack([self.respond_head(torch.cat([state, self.encode_action(mv), lord_enc])) for mv in possible])
         idx = torch.multinomial(F.softmax(scores.squeeze(-1), dim=0), 1).item() if self.train_mode else torch.argmax(scores).item()
         return possible[idx]
